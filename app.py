@@ -1,12 +1,24 @@
 import dash
 from dash import html, dcc, callback, ctx
-from dash.dependencies import Input, Output
+from dash.dependencies import Input, Output, State
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import pandas as pd
 import us
 import plotly.express as px
 from dash import dash_table  # For the Records tab data table
+import plotly.io as pio
+from dash.dependencies import Input, Output, State
+import plotly.io as pio
+import base64
+from io import BytesIO
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+import datetime
+from plotly.subplots import make_subplots
 
 # ------------------------------------------------------------------
 # 1. Read CSV and prep data
@@ -18,7 +30,7 @@ df["Revenue"] = pd.to_numeric(df["Revenue"].replace('[\\$,]', '', regex=True), e
 
 df["Profit"] = df["Profit"].replace([r'\$', r','], regex = True, value = '')
 df["Profit"] = df["Profit"].apply(lambda x:- float(x[1:-1]) if x.startswith("(") and x.endswith(")") else float(x))
-print(df["Profit"])
+#print(df["Profit"])
 
 # Convert Order Date to datetime, then create Year & Month columns
 df["Order Date"] = pd.to_datetime(df["Order Date"])
@@ -44,7 +56,7 @@ df_monthly = (
 # For the year dropdown, show unique years (descending order)
 year_options = sorted(df["Year"].unique(), reverse=True)
 year_options = year_options[:3]
-print(year_options)
+#print(year_options)
 
 # ------------------------------------------------------------------
 # 2. Initialize the Dash app
@@ -148,10 +160,19 @@ header = dbc.Container([
                     ),
                     width="auto"
                 ),
-                dbc.Col(
-                    dbc.Button("Export", color="primary", className="px-4"),
-                    width="auto"
-                ),
+                dbc.Col([
+                    dbc.DropdownMenu(
+                        [
+                            dbc.DropdownMenuItem("Export as PDF", id="export-pdf-btn"),
+                            dbc.DropdownMenuItem("Export as Image", id="export-image-btn"),
+                        ],
+                        label="Export",
+                        color="primary",
+                        className="px-4"
+                    ),
+                    # dcc.Download(id="download-pdf"),
+                    # dcc.Download(id="download-image"),
+                ], width="auto"),
             ],
             justify="end",
             align="center",
@@ -428,6 +449,13 @@ def create_horizontal_bar(data, title, selected_metric):
             val_col = 'value'
             margin_bot1 = "38px"
             margin_bot2 = "12px"
+        elif title == 'Region':
+            value = row[f'{selected_metric}_current']
+            val_col = f'{selected_metric}_current'
+            margin_bot1 = "24px"
+            margin_bot2 = "2px"
+
+      
         label = row[title]
         change = row["% Change"]
         color = 'green' if change >= 0 else 'red'
@@ -447,7 +475,8 @@ def create_horizontal_bar(data, title, selected_metric):
             ], style = {"display": "flex", "alignItems":"center", "gap": "8px"})
             
             
-        ])) 
+        ], style = {"marginBottom": margin_bot1}
+        )) 
     return html.Div([html.H5(title, style = {"fontweight": "bold", "marginBottom": "25px"}), 
                      *blocks], style={"padding": "10px", "border": "1px solid #eee", "borderRadius": "10px", "width": "300px"})
     
@@ -482,7 +511,7 @@ def create_state_map(df, py_df, selected_year, metric):
     merge_df['State'] = merge_df['State'].astype(str).str.strip()
     merge_df= merge_df[merge_df['State'] != '0']
     merge_df["State full name"] = merge_df["State"].apply(lambda abbr:us.states.lookup(abbr).name if us.states.lookup(abbr) else abbr)
-    print(merge_df)
+    #print(merge_df)
 
     custom_data2 = merge_df.apply(
         lambda
@@ -562,92 +591,146 @@ def create_state_map(df, py_df, selected_year, metric):
     return fig
 
 # Helper function to create horizontal bar charts with reference lines
-def create_horizontal_bar_with_reference(df, x_col, y_col, title, show_values=False, is_currency=False, color_highest=False):
+def create_horizontal_bar_with_reference_and_hover(df, df_prev, x_col, y_col, title, selected_year, show_values=False, is_currency=False, color_highest=False):
     """
-    Create a horizontal bar chart with reference lines matching the style shown in the image
+    Create a horizontal bar chart with reference lines and hover data showing percentage changes
     
     Args:
-        df: DataFrame with data
+        df: DataFrame with current year data (already filtered/sorted)
+        df_prev: DataFrame with previous year data  
         x_col: Column name for x-axis values
         y_col: Column name for y-axis labels
         title: Chart title
+        selected_year: Current year for display
         show_values: Whether to show values at the end of bars
         is_currency: Whether to format values as currency
         color_highest: Whether to color the highest value bar differently
     """
-    # Sort the dataframe by the x_col in descending order
-    df = df.sort_values(by=x_col, ascending=False)
+    # Start with the current year data (which is already sorted and limited)
+    # and merge with previous year data using LEFT join to keep only current year entries
+    merged_df = pd.merge(df[[y_col, x_col]], df_prev[[y_col, x_col]], on=y_col, how='left', suffixes=('_current', '_previous')).fillna(0)
     
-    # Create a copy to avoid modifying the original dataframe
-    plot_df = df.copy()
+    # Calculate percentage change
+    merged_df['% Change'] = merged_df.apply(
+        lambda row: ((row[f'{x_col}_current'] - row[f'{x_col}_previous']) / row[f'{x_col}_previous']) * 100 
+        if row[f'{x_col}_previous'] != 0 else 0, axis=1
+    )
     
-    # Get the average value for the reference line
-    avg_value = plot_df[x_col].mean()
+    # Add arrow and color for percentage change
+    merged_df['arrow'] = merged_df['% Change'].apply(lambda x: '▲' if x > 0 else '▼')
+    merged_df['colors_pct'] = merged_df['% Change'].apply(lambda x: 'green' if x > 0 else 'red')
+    
+    # Keep the original sort order from the input df (don't re-sort)
+    # This preserves the Top 5 limitation and original sorting
     
     # Create colors list - highlight the highest value if requested
     if color_highest:
-        colors = ['#4662D9' if i == 0 else '#A7C7E7' for i in range(len(plot_df))]
+        colors = ['#4662D9' if i == 0 else '#A7C7E7' for i in range(len(merged_df))]
     else:
-        colors = ['#A7C7E7'] * len(plot_df)
+        colors = ['#A7C7E7'] * len(merged_df)
+    
+    # Format values for display
+    def format_value(value, is_currency):
+        if is_currency:
+            return f"${value:,.0f}" if value >= 1 else f"${value:,.2f}"
+        else:
+            return f"{int(value):,}" if value == int(value) else f"{value:,.0f}"
+    
+    # Create custom data for hover
+    previous_year = int(selected_year) - 1
+    custom_data = merged_df.apply(
+        lambda row: [
+            format_value(row[f'{x_col}_previous'], is_currency),  # Previous year formatted
+            format_value(row[f'{x_col}_current'], is_currency),   # Current year formatted
+            f"{row['% Change']:.2f}%",                           # Percentage change
+            row['arrow'],                                        # Arrow direction
+            row['colors_pct']                                    # Color for percentage
+        ], axis=1
+    ).values
     
     # Create the horizontal bar chart
     fig = go.Figure()
     
-    # Add bars
+    # Add bars with custom hover template
     fig.add_trace(go.Bar(
-        x=plot_df[x_col],
-        y=plot_df[y_col],
+        x=merged_df[f'{x_col}_current'],
+        y=merged_df[y_col],
         orientation='h',
         marker_color=colors,
-        width=0.6,  # Make bars thinner
+        width=0.6,
+        showlegend=False,
+        customdata=custom_data,
+        hovertemplate=(
+            "<br><br>"
+            "<b style='font-size: 14px;'>%{y}</b><br><br>"
+            "%{customdata[3]} <span style='color:%{customdata[4]}; font-weight:bold; font-size:15px;'>"
+            "%{customdata[2]}</span><br>"
+            "_________________<br><br>"
+            f"{selected_year} {x_col}: <b>%{{customdata[1]}}</b><br>"
+            f"{previous_year} {x_col}: <b>%{{customdata[0]}}</b><br>"
+            "_________________<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+            "<extra></extra>"
+        ),
+        hoverlabel=dict(
+            bgcolor="rgba(255, 255, 255, .7)",
+            font=dict(color="black", size=12)
+        )
     ))
     
-    # Add reference lines (vertical black lines) at specific positions
-    for i, row in plot_df.iterrows():
-        # Add a vertical line at a position that's about 70% of the max value
-        reference_position = 0.7 * plot_df[x_col].max()
-        
+    # Add reference lines (vertical black lines) at 70% of max value
+    reference_position = 0.7 * merged_df[f'{x_col}_current'].max()
+    
+    for i in range(len(merged_df)):
         fig.add_shape(
             type="line",
             x0=reference_position,
             x1=reference_position,
-            y0=i - 0.25,  # Adjust to align with the bar
-            y1=i + 0.25,  # Adjust to align with the bar
+            y0=i - 0.25,
+            y1=i + 0.25,
             line=dict(color="black", width=2),
         )
     
-    # Add value labels at the end of bars if requested
-    if show_values:
-        for i, row in plot_df.iterrows():
-            value = row[x_col]
-            if is_currency:
-                value_text = f"${value:,.2f}"
-            else:
-                value_text = f"{int(value)}" if isinstance(value, (int, float)) and value.is_integer() else f"{value:,.1f}"
-            
-            fig.add_annotation(
-                x=value,
-                y=row[y_col],
-                text=value_text,
-                showarrow=False,
-                xshift=5,
-                align="left",
-                font=dict(color="#4662D9" if i == 0 and color_highest else "black")
+    # Add value labels at the end of bars
+    for i, (_, row) in enumerate(merged_df.iterrows()):
+        value = row[f'{x_col}_current']
+        value_text = format_value(value, is_currency)
+        
+        # Position text at the end of each bar
+        fig.add_annotation(
+            x=value + (merged_df[f'{x_col}_current'].max() * 0.02),
+            y=row[y_col],
+            text=value_text,
+            showarrow=False,
+            xanchor="left",
+            font=dict(
+                color="#4662D9" if colors[i] == '#4662D9' else "#666666",
+                size=12,
+                family="Arial"
             )
+        )
     
-    # Update layout for clean appearance
+    # Update layout
     fig.update_layout(
-        title=title,
-        title_font=dict(size=14),
-        margin=dict(l=0, r=40, t=30, b=10),  # Increased right margin for value labels
+        title=dict(
+            text=title,
+            font=dict(size=16, family="Arial", color="#333333"),
+            x=0,
+            xanchor='left'
+        ),
+        margin=dict(l=80, r=80, t=50, b=20),
         height=250,
         xaxis=dict(
             showticklabels=False,
             showgrid=False,
             zeroline=False,
+            range=[0, merged_df[f'{x_col}_current'].max() * 1.15]
         ),
         yaxis=dict(
-            autorange="reversed",  # Reverse y-axis to match your image
+            autorange="reversed",
+            showgrid=False,
+            zeroline=False,
+            tickfont=dict(size=12, family="Arial", color="#666666")
         ),
         plot_bgcolor='rgba(0,0,0,0)',
         paper_bgcolor='rgba(0,0,0,0)',
@@ -656,147 +739,127 @@ def create_horizontal_bar_with_reference(df, x_col, y_col, title, show_values=Fa
     
     return fig
 
-# Create a function to generate the Insights tab content
 def create_insights_tab(df, selected_year):
     """
-    Creates the Insights tab content with Top 5 States and Segments charts
-    
-    Args:
-        df: DataFrame with sales data
-        selected_year: Selected year for filtering
-    
-    Returns:
-        A Dash component representing the Insights tab
+    Creates the Insights tab content with Top 5 States and Segments charts with hover functionality
     """
-    # Filter data for selected year
+    # Filter data for selected and previous year
     df_year = df[df["Year"] == int(selected_year)]
+    df_prev_year = df[df["Year"] == int(selected_year) - 1]
     
     # -----------------------------------------------------------------
     # State-level aggregations for Top 5 States charts
     # -----------------------------------------------------------------
-    # Quantity by State
+    # Current year data
     df_state_qty = df_year.groupby("State", as_index=False)["Quantity"].sum().sort_values("Quantity", ascending=False).head(5)
-    
-    # Revenue by State
     df_state_rev = df_year.groupby("State", as_index=False)["Revenue"].sum().sort_values("Revenue", ascending=False).head(5)
-    
-    # Profit by State
     df_state_profit = df_year.groupby("State", as_index=False)["Profit"].sum().sort_values("Profit", ascending=False).head(5)
-    
-    # Customers by State
     df_state_cust = df_year.groupby("State", as_index=False)["Customer ID"].nunique().rename(
         columns={"Customer ID": "Customers"}
     ).sort_values("Customers", ascending=False).head(5)
     
+    # Previous year data
+    df_state_qty_prev = df_prev_year.groupby("State", as_index=False)["Quantity"].sum()
+    df_state_rev_prev = df_prev_year.groupby("State", as_index=False)["Revenue"].sum()
+    df_state_profit_prev = df_prev_year.groupby("State", as_index=False)["Profit"].sum()
+    df_state_cust_prev = df_prev_year.groupby("State", as_index=False)["Customer ID"].nunique().rename(
+        columns={"Customer ID": "Customers"}
+    )
+    
     # -----------------------------------------------------------------
-    # Segment-level aggregations (using existing Segment column)
+    # Segment-level aggregations
     # -----------------------------------------------------------------
-    # Quantity by Segment
+    # Current year data
     df_seg_qty = df_year.groupby("Segment", as_index=False)["Quantity"].sum().sort_values("Quantity", ascending=False)
-    
-    # Revenue by Segment
     df_seg_rev = df_year.groupby("Segment", as_index=False)["Revenue"].sum().sort_values("Revenue", ascending=False)
-    
-    # Profit by Segment
     df_seg_profit = df_year.groupby("Segment", as_index=False)["Profit"].sum().sort_values("Profit", ascending=False)
-    
-    # Customers by Segment
     df_seg_cust = df_year.groupby("Segment", as_index=False)["Customer ID"].nunique().rename(
         columns={"Customer ID": "Customers"}
     ).sort_values("Customers", ascending=False)
     
-    # -----------------------------------------------------------------
-    # Create charts for Top 5 States
-    # -----------------------------------------------------------------
-    # Quantity by State
-    fig_state_qty = create_horizontal_bar_with_reference(
-        df_state_qty, 
-        x_col="Quantity", 
-        y_col="State", 
-        title="Top 5 States by Quantity",
-        show_values=True,
-        color_highest=True
-    )
-    
-    # Revenue by State
-    fig_state_rev = create_horizontal_bar_with_reference(
-        df_state_rev, 
-        x_col="Revenue", 
-        y_col="State", 
-        title="Top 5 States by Revenue",
-        show_values=True,
-        is_currency=True,
-        color_highest=True
-    )
-    
-    # Profit by State
-    fig_state_profit = create_horizontal_bar_with_reference(
-        df_state_profit, 
-        x_col="Profit", 
-        y_col="State", 
-        title="Top 5 States by Profit",
-        show_values=True,
-        is_currency=True,
-        color_highest=True
-    )
-    
-    # Customers by State
-    fig_state_cust = create_horizontal_bar_with_reference(
-        df_state_cust, 
-        x_col="Customers", 
-        y_col="State", 
-        title="Top 5 States by Customers",
-        show_values=True,
-        color_highest=True
+    # Previous year data
+    df_seg_qty_prev = df_prev_year.groupby("Segment", as_index=False)["Quantity"].sum()
+    df_seg_rev_prev = df_prev_year.groupby("Segment", as_index=False)["Revenue"].sum()
+    df_seg_profit_prev = df_prev_year.groupby("Segment", as_index=False)["Profit"].sum()
+    df_seg_cust_prev = df_prev_year.groupby("Segment", as_index=False)["Customer ID"].nunique().rename(
+        columns={"Customer ID": "Customers"}
     )
     
     # -----------------------------------------------------------------
-    # Create charts for Segments
+    # Ship Mode-level aggregations
     # -----------------------------------------------------------------
-    # Quantity by Segment
-    fig_seg_qty = create_horizontal_bar_with_reference(
-        df_seg_qty, 
-        x_col="Quantity", 
-        y_col="Segment", 
-        title="Segments by Quantity",
-        show_values=True,
-        color_highest=True
-    )
+    # Current year data
+    df_ship_qty = df_year.groupby("Ship Mode", as_index=False)["Quantity"].sum().sort_values("Quantity", ascending=False)
+    df_ship_rev = df_year.groupby("Ship Mode", as_index=False)["Revenue"].sum().sort_values("Revenue", ascending=False)
+    df_ship_profit = df_year.groupby("Ship Mode", as_index=False)["Profit"].sum().sort_values("Profit", ascending=False)
+    df_ship_cust = df_year.groupby("Ship Mode", as_index=False)["Customer ID"].nunique().rename(
+        columns={"Customer ID": "Customers"}
+    ).sort_values("Customers", ascending=False)
     
-    # Revenue by Segment
-    fig_seg_rev = create_horizontal_bar_with_reference(
-        df_seg_rev, 
-        x_col="Revenue", 
-        y_col="Segment", 
-        title="Segments by Revenue",
-        show_values=True,
-        is_currency=True,
-        color_highest=True
-    )
-    
-    # Profit by Segment
-    fig_seg_profit = create_horizontal_bar_with_reference(
-        df_seg_profit, 
-        x_col="Profit", 
-        y_col="Segment", 
-        title="Segments by Profit",
-        show_values=True,
-        is_currency=True,
-        color_highest=True
-    )
-    
-    # Customers by Segment
-    fig_seg_cust = create_horizontal_bar_with_reference(
-        df_seg_cust, 
-        x_col="Customers", 
-        y_col="Segment", 
-        title="Segments by Customers",
-        show_values=True,
-        color_highest=True
+    # Previous year data
+    df_ship_qty_prev = df_prev_year.groupby("Ship Mode", as_index=False)["Quantity"].sum()
+    df_ship_rev_prev = df_prev_year.groupby("Ship Mode", as_index=False)["Revenue"].sum()
+    df_ship_profit_prev = df_prev_year.groupby("Ship Mode", as_index=False)["Profit"].sum()
+    df_ship_cust_prev = df_prev_year.groupby("Ship Mode", as_index=False)["Customer ID"].nunique().rename(
+        columns={"Customer ID": "Customers"}
     )
     
     # -----------------------------------------------------------------
-    # Create the layout with two rows of charts
+    # Create charts with hover functionality
+    # -----------------------------------------------------------------
+    # Top 5 States charts
+    fig_state_qty = create_horizontal_bar_with_reference_and_hover(
+        df_state_qty, df_state_qty_prev, "Quantity", "State", "Top 5 States by Quantity", selected_year, color_highest=True
+    )
+    
+    fig_state_rev = create_horizontal_bar_with_reference_and_hover(
+        df_state_rev, df_state_rev_prev, "Revenue", "State", "Top 5 States by Revenue", selected_year, is_currency=True, color_highest=True
+    )
+    
+    fig_state_profit = create_horizontal_bar_with_reference_and_hover(
+        df_state_profit, df_state_profit_prev, "Profit", "State", "Top 5 States by Profit", selected_year, is_currency=True, color_highest=True
+    )
+    
+    fig_state_cust = create_horizontal_bar_with_reference_and_hover(
+        df_state_cust, df_state_cust_prev, "Customers", "State", "Top 5 States by Customers", selected_year, color_highest=True
+    )
+    
+    # Segments charts
+    fig_seg_qty = create_horizontal_bar_with_reference_and_hover(
+        df_seg_qty, df_seg_qty_prev, "Quantity", "Segment", "Segments by Quantity", selected_year, color_highest=True
+    )
+    
+    fig_seg_rev = create_horizontal_bar_with_reference_and_hover(
+        df_seg_rev, df_seg_rev_prev, "Revenue", "Segment", "Segments by Revenue", selected_year, is_currency=True, color_highest=True
+    )
+    
+    fig_seg_profit = create_horizontal_bar_with_reference_and_hover(
+        df_seg_profit, df_seg_profit_prev, "Profit", "Segment", "Segments by Profit", selected_year, is_currency=True, color_highest=True
+    )
+    
+    fig_seg_cust = create_horizontal_bar_with_reference_and_hover(
+        df_seg_cust, df_seg_cust_prev, "Customers", "Segment", "Segments by Customers", selected_year, color_highest=True
+    )
+    
+    # Ship Mode charts
+    fig_ship_qty = create_horizontal_bar_with_reference_and_hover(
+        df_ship_qty, df_ship_qty_prev, "Quantity", "Ship Mode", "Ship Mode by Quantity", selected_year, color_highest=True
+    )
+    
+    fig_ship_rev = create_horizontal_bar_with_reference_and_hover(
+        df_ship_rev, df_ship_rev_prev, "Revenue", "Ship Mode", "Ship Modes by Revenue", selected_year, is_currency=True, color_highest=True
+    )
+    
+    fig_ship_profit = create_horizontal_bar_with_reference_and_hover(
+        df_ship_profit, df_ship_profit_prev, "Profit", "Ship Mode", "Ship Modes by Profit", selected_year, is_currency=True, color_highest=True
+    )
+    
+    fig_ship_cust = create_horizontal_bar_with_reference_and_hover(
+        df_ship_cust, df_ship_cust_prev, "Customers", "Ship Mode", "Ship Modes by Customers", selected_year, color_highest=True
+    )
+    
+    # -----------------------------------------------------------------
+    # Create the layout with three rows of charts
     # -----------------------------------------------------------------
     return dbc.Container([
         # Header
@@ -837,85 +900,24 @@ def create_insights_tab(df, selected_year):
             dbc.Col([
                 dcc.Graph(figure=fig_seg_cust, config={"displayModeBar": False}, style={"height": "250px"})
             ], width=3),
+        ], className="mb-4"),
+        
+        # Third row: Ship Mode charts
+        dbc.Row([
+            dbc.Col([
+                dcc.Graph(figure=fig_ship_qty, config={"displayModeBar": False}, style={"height": "250px"})
+            ], width=3),
+            dbc.Col([
+                dcc.Graph(figure=fig_ship_rev, config={"displayModeBar": False}, style={"height": "250px"})
+            ], width=3),
+            dbc.Col([
+                dcc.Graph(figure=fig_ship_profit, config={"displayModeBar": False}, style={"height": "250px"})
+            ], width=3),
+            dbc.Col([
+                dcc.Graph(figure=fig_ship_cust, config={"displayModeBar": False}, style={"height": "250px"})
+            ], width=3),
         ]),
     ], fluid=True)
-
-# Function to generate the records tab content
-# def generate_records_tab(selected_year):
-#     """Generate the Records tab content"""
-#     df_year = df[df["Year"] == int(selected_year)]
-    
-#     # Create a copy with formatted columns for display
-#     df_display = df_year.copy()
-    
-#     # Format currency columns
-#     for col in ['Revenue', 'Profit']:
-#         if col in df_display.columns:
-#             df_display[col] = df_display[col].apply(lambda x: f"${x:,.2f}" if pd.notnull(x) else "")
-    
-#     # Format date columns
-#     for col in ['Order Date', 'Ship Date']:
-#         if col in df_display.columns:
-#             df_display[col] = pd.to_datetime(df_display[col]).dt.strftime('%m/%d/%Y')
-    
-#     # Get column names for the data table, excluding some utility columns
-#     columns_to_display = [col for col in df_display.columns if col in ['Customer Name', 'City', 'Category', 'Order Date', 'Segment', 'Ship Date', 'Ship Mode', 'State', 'Sub-Category', 'Revenue']]
-    
-#     return dbc.Container([
-#         # Header
-#         dbc.Row([
-#             dbc.Col([
-#                 html.H1("Records", className="display-5 fw-bold"),
-#                 html.P("Browse and filter detailed transaction records."),
-#             ], width=12),
-#         ], className="py-3"),
-        
-#         # Data table
-#         dbc.Row([
-#             dbc.Col([
-#                 dbc.Card(
-#                     dbc.CardBody([
-#                         html.H5(f"Order Records ({len(df_display)} rows)", className="card-title mb-3"),
-#                         dash_table.DataTable(
-#                             id='records-table',
-#                             columns=[{"name": i, "id": i} for i in columns_to_display],
-#                             data=df_display[columns_to_display].to_dict('records'),
-#                             page_size=15,
-#                             filter_action="native",
-#                             sort_action="native",
-#                             style_table={'overflowX': 'auto', 'height': '600px', 'overflowY': 'auto'},
-#                             style_cell={
-#                                 'overflow': 'hidden',
-#                                 'textOverflow': 'ellipsis',
-#                                 'maxWidth': 0,
-#                                 'fontSize': '12px',
-#                                 'fontFamily': 'Arial',
-#                                 'padding': '5px'
-#                             },
-#                             style_header={
-#                                 'backgroundColor': 'rgb(240, 240, 240)',
-#                                 'fontWeight': 'bold',
-#                                 'border': '1px solid #ddd'
-#                             },
-#                             style_data={
-#                                 'whiteSpace': 'normal',
-#                                 'height': 'auto',
-#                                 'lineHeight': '15px',
-#                                 'border': '1px solid #ddd'
-#                             },
-#                             style_data_conditional=[
-#                                 {
-#                                     'if': {'row_index': 'odd'},
-#                                     'backgroundColor': 'rgb(248, 248, 248)'
-#                                 }
-#                             ],
-#                         )
-#                     ]),
-#                     className="shadow-sm"
-#                 )
-#             ], width=12)
-#         ])
-#     ], fluid=True)
 
 def generate_records_tab(selected_year):
     """Generate the Records tab content with a styled card layout"""
@@ -1080,13 +1082,28 @@ def generate_sales_dashboard(selected_year, selected_metric):
         sup_cat_prev = df_previous_yr[df_previous_yr["Category"] == 'Office Supplies'][selected_metric].sum()
         tech_cat_prev = df_previous_yr[df_previous_yr["Category"] == 'Technology'][selected_metric].sum()
 
+    
+
     category_df = pd.DataFrame({"Category":["Furniture", "Office Supplies", "Technology"],
                                 "value": [fur_cat, sup_cat, tech_cat],
                                 "previous value": [fur_cat_prev, sup_cat_prev, tech_cat_prev]})
     
+    
     category_df["% Change"] = ((category_df["value"] - category_df["previous value"]) / category_df["previous value"]) * 100
     category_fig = create_horizontal_bar(category_df, "Category", selected_metric)
-    #region_fig = create_horizontal_bar(None, "Region", is_category=False)
+
+    if selected_metric == "Customer ID":
+        region_df = df_filter.groupby('Region', as_index = False)["Customer ID"].nunique()
+        region_df_prev = df_previous_yr.groupby('Region', as_index = False)["Customer ID"].nunique()
+    else:
+        region_df = df_filter.groupby('Region', as_index = False)[selected_metric].sum()
+        region_df_prev = df_previous_yr.groupby('Region', as_index = False)[selected_metric].sum()
+
+
+    total_region_df =  pd.merge(region_df[['Region', selected_metric]], region_df_prev[['Region', selected_metric]], on = "Region", how = "outer", suffixes = ('_current', '_previous')).fillna(0)
+    total_region_df["% Change"] = ((total_region_df[f'{selected_metric}_current']- total_region_df[f'{selected_metric}_previous']) / total_region_df[f'{selected_metric}_previous']) * 100
+
+    region_fig = create_horizontal_bar(total_region_df, "Region", selected_metric)
     
     # Calculate national average
     if selected_metric == "Customer ID":    
@@ -1311,7 +1328,7 @@ def generate_sales_dashboard(selected_year, selected_metric):
                             ], width = 6),
                              dbc.Col([
                                 html.Div([
-                                    category_fig
+                                    region_fig
                 ], style={
                                    "display": "flex",
                                    "justifyContent": "center"})
@@ -1358,37 +1375,195 @@ def generate_sales_dashboard(selected_year, selected_metric):
     #     ], className="g-3 mb-3"),
     # ], fluid=True)
 
+def create_export_data(selected_year, selected_metric):
+    """Create data for export"""
+    df_filter = df[df["Year"] == int(selected_year)]
+    df_previous_yr = df[df["Year"] == int(selected_year) - 1]
+    
+    # Calculate metrics
+    total_customers = df_filter["Customer ID"].nunique()
+    total_revenue = df_filter['Revenue'].sum()
+    total_quantity = df_filter['Quantity'].sum()
+    total_profit = df_filter['Profit'].sum()
+    
+    # Calculate percentage changes
+    revenue_change = ((total_revenue - df_previous_yr["Revenue"].sum()) / df_previous_yr["Revenue"].sum()) * 100 if df_previous_yr["Revenue"].sum() > 0 else 0
+    quantity_change = ((total_quantity - df_previous_yr["Quantity"].sum()) / df_previous_yr["Quantity"].sum()) * 100 if df_previous_yr["Quantity"].sum() > 0 else 0
+    customers_change = ((total_customers - df_previous_yr["Customer ID"].nunique()) / df_previous_yr["Customer ID"].nunique()) * 100 if df_previous_yr["Customer ID"].nunique() > 0 else 0
+    profit_change = ((total_profit - df_previous_yr["Profit"].sum()) / df_previous_yr["Profit"].sum()) * 100 if df_previous_yr["Profit"].sum() > 0 else 0
+    
+    return {
+        'year': selected_year,
+        'metric': selected_metric,
+        'total_customers': total_customers,
+        'total_revenue': total_revenue,
+        'total_quantity': total_quantity,
+        'total_profit': total_profit,
+        'revenue_change': revenue_change,
+        'quantity_change': quantity_change,
+        'customers_change': customers_change,
+        'profit_change': profit_change
+    }
+
+# def create_dashboard_image(selected_year, selected_metric):
+#     """Create a comprehensive dashboard image for export"""
+#     try:
+#         # Ensure kaleido is available for image export
+#         import kaleido
+#     except ImportError:
+#         # Fallback: create a simple chart if kaleido is not available
+#         print("Kaleido not installed. Install with: pip install kaleido")
+        
+#     df_filter = df[df["Year"] == int(selected_year)]
+#     df_previous_yr = df[df["Year"] == int(selected_year) - 1]
+    
+#     # Calculate metrics for the image
+#     total_customers = df_filter["Customer ID"].nunique()
+#     total_revenue = f"${df_filter['Revenue'].sum()/1000:,.0f}K"
+#     total_quantity = f"{df_filter['Quantity'].sum():,.0f}"
+#     total_profit = f"${df_filter['Profit'].sum()/1000:,.0f}K"
+    
+#     # Create a subplot with the main bar chart and some KPI text
+#     fig = make_subplots(
+#         rows=2, cols=2,
+#         subplot_titles=(f'{selected_year} Sales Dashboard', f'Monthly {selected_metric}', 'Key Metrics', ''),
+#         specs=[[{"colspan": 2}, None],
+#                [{"type": "table"}, {"type": "xy"}]],
+#         row_heights=[0.7, 0.3]
+#     )
+    
+#     # Add the main bar chart
+#     bar_fig = create_bar_chart(metric=selected_metric, selected_year=selected_year)
+    
+#     # Extract bar chart data
+#     for trace in bar_fig.data:
+#         fig.add_trace(trace, row=1, col=1)
+    
+#     # Add KPI table
+#     fig.add_trace(
+#         go.Table(
+#             header=dict(values=['Metric', 'Value'],
+#                        fill_color='#1c4e8b',
+#                        font=dict(color='white', size=12),
+#                        align="left"),
+#             cells=dict(values=[['Customers', 'Revenue', 'Quantity', 'Profit'],
+#                               [f'{total_customers:,}', total_revenue, total_quantity, total_profit]],
+#                       fill_color='lightgray',
+#                       align="left",
+#                       font=dict(size=11))
+#         ),
+#         row=2, col=1
+#     )
+    
+#     # Update layout for better appearance
+#     fig.update_layout(
+#         title=dict(
+#             text=f"Sales Dashboard - {selected_year}",
+#             font=dict(size=20, color='#1c4e8b'),
+#             x=0.5
+#         ),
+#         showlegend=True,
+#         height=800,
+#         width=1200,
+#         paper_bgcolor='white',
+#         plot_bgcolor='white'
+#     )
+    
+#     # Update x-axis and y-axis for the bar chart
+#     fig.update_xaxes(title_text="Month", row=1, col=1)
+#     fig.update_yaxes(title_text=selected_metric, row=1, col=1)
+    
+#     # Convert to PNG bytes
+#     img_bytes = pio.to_image(
+#         fig, 
+#         format="png", 
+#         width=1200, 
+#         height=800, 
+#         scale=2,
+#         engine="kaleido"  # Explicitly specify the engine
+#     )
+    
+#     return img_bytes
+
+# def export_to_pdf(export_data):
+#     """Create PDF export"""
+#     buffer = BytesIO()
+    
+#     # Create PDF document
+#     doc = SimpleDocTemplate(buffer, pagesize=A4)
+#     styles = getSampleStyleSheet()
+#     story = []
+    
+#     # Title
+#     title_style = ParagraphStyle(
+#         'CustomTitle',
+#         parent=styles['Heading1'],
+#         fontSize=24,
+#         textColor=colors.HexColor('#1c4e8b'),
+#         spaceAfter=30
+#     )
+#     story.append(Paragraph(f"Sales Dashboard Report - {export_data['year']}", title_style))
+#     story.append(Spacer(1, 20))
+    
+#     # Summary section
+#     story.append(Paragraph("Executive Summary", styles['Heading2']))
+#     story.append(Spacer(1, 12))
+    
+#     # KPI Table
+#     kpi_data = [
+#         ['Metric', f'{export_data["year"]} Value', 'Change vs Previous Year'],
+#         ['Customers', f"{export_data['total_customers']:,}", f"{export_data['customers_change']:.2f}%"],
+#         ['Revenue', f"${export_data['total_revenue']:,.0f}", f"{export_data['revenue_change']:.2f}%"],
+#         ['Quantity', f"{export_data['total_quantity']:,}", f"{export_data['quantity_change']:.2f}%"],
+#         ['Profit', f"${export_data['total_profit']:,.0f}", f"{export_data['profit_change']:.2f}%"]
+#     ]
+    
+#     kpi_table = Table(kpi_data, colWidths=[2*inch, 2*inch, 2*inch])
+#     kpi_table.setStyle(TableStyle([
+#         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1c4e8b')),
+#         ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+#         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+#         ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+#         ('FONTSIZE', (0, 0), (-1, 0), 12),
+#         ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+#         ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+#         ('GRID', (0, 0), (-1, -1), 1, colors.black)
+#     ]))
+    
+#     story.append(kpi_table)
+#     story.append(Spacer(1, 30))
+    
+#     # Add chart image
+#     try:
+#         chart_img = create_dashboard_image(export_data['year'], export_data['metric'])
+#         img = Image(BytesIO(chart_img), width=6*inch, height=4*inch)
+#         story.append(Paragraph("Monthly Performance Chart", styles['Heading2']))
+#         story.append(Spacer(1, 12))
+#         story.append(img)
+#     except Exception as e:
+#         story.append(Paragraph(f"Chart could not be generated: {str(e)}", styles['Normal']))
+    
+#     story.append(Spacer(1, 30))
+    
+#     # Footer
+#     footer_text = f"Generated on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+#     story.append(Paragraph(footer_text, styles['Normal']))
+    
+#     # Build PDF
+#     doc.build(story)
+#     buffer.seek(0)
+#     return buffer.getvalue()
+
+
+
 # ------------------------------------------------------------------
 # 8. App Layout - UPDATED
 # ------------------------------------------------------------------
-app.layout = html.Div([
+app.layout = html.Div(id = "dashboard-image", children = [
     dbc.Card(
         dbc.Container([
             top_nav,
             header,
-            # Move tabs to the main layout
-            # dcc.Tabs(
-            #     id="tabs",
-            #     value="sales_dashboard",  # Default tab selected
-            #     children=[
-            #         dcc.Tab(
-            #             label="Sales Dashboard",
-            #             value="sales_dashboard",
-            #             children=[html.Div(id="sales-dashboard-content")]  # This div will be populated by the callback
-            #         ),
-            #         dcc.Tab(
-            #             label="Insights",
-            #             value="insights",
-            #             children=[html.Div(id="insights-content")]  # This div will be populated by the callback
-            #         ),
-            #         dcc.Tab(
-            #             label="Records",
-            #             value="records",
-            #             children=[html.Div(id="records-content")]  # This div will be populated by the callback
-            #         )
-            #     ],
-            #     style={"backgroundColor": "#fff", "padding": "10px"}
-            # ),
             dcc.Store(id="selected-tab", data="sales_dashboard"),
             html.Div(id="tab-content")  # This is a placeholder that will be populated by the callback
         ]),
@@ -1422,7 +1597,7 @@ def render_tab_content(selected_tab, selected_year, selected_metric):
     return html.Div("Please select a tab")
 
 @callback(
-    Output("selected-tabs", "data"),
+    Output("selected-tab", "data"),
     [
         Input("nav-dashboard", "n_clicks"),
         Input("nav-insight", "n_clicks"),
@@ -1439,7 +1614,88 @@ def switch_tab(n1, n2, n3):
         return "records"
     return dash.no_update
 
+# @callback(
+#     Output("download-pdf", "data"),
+#     Input("export-pdf-btn", "n_clicks"),
+#     [State("year-dropdown", "value"), State("metric-dropdown", "value")],
+#     prevent_initial_call=True
+# )
+# def export_pdf(n_clicks, selected_year, selected_metric):
+#     if n_clicks:
+#         # Create export data
+#         export_data = create_export_data(selected_year, selected_metric)
+        
+#         # Generate PDF
+#         pdf_bytes = export_to_pdf(export_data)
+        
+#         # Return download
+#         return dcc.send_bytes(
+#             pdf_bytes,
+#             filename=f"sales_dashboard_{selected_year}_{selected_metric}.pdf"
+#         )
+#     return dash.no_update
 
+# def create_simple_dashboard_image(selected_year, selected_metric):
+#     """Create a simple dashboard image - fallback version"""
+#     # Create just the main bar chart
+#     fig = create_bar_chart(metric=selected_metric, selected_year=selected_year)
+    
+#     # Update layout for export
+#     fig.update_layout(
+#         title=dict(
+#             text=f"Sales Dashboard - {selected_year} - {selected_metric}",
+#             font=dict(size=16, color='#1c4e8b'),
+#             x=0.5
+#         ),
+#         width=1000,
+#         height=600,
+#         paper_bgcolor='white'
+#     )
+    
+#     # Convert to PNG bytes
+#     img_bytes = pio.to_image(
+#         fig, 
+#         format="png", 
+#         width=1000, 
+#         height=600, 
+#         scale=2
+#     )
+    
+#     return img_bytes
+
+# Callback for Image export
+# @callback(
+#     Output("download-image", "data"),
+#     Input("export-image-btn", "n_clicks"),
+#     [State("year-dropdown", "value"), State("metric-dropdown", "value")],
+#     prevent_initial_call=True
+# )
+# def export_image(n_clicks, selected_year, selected_metric):
+#     print(f"Export image clicked: {n_clicks}, Year: {selected_year}, Metric: {selected_metric}")
+#     if n_clicks:
+#         return dash.no_update
+#     try:
+#             # Create the figure
+#             fig = create_bar_chart(metric=selected_metric, selected_year=selected_year)
+            
+#             # layout for export
+#             fig.update_layout(
+#                 title=f"Sales Dashboard {selected_year} - {selected_metric}",
+#                 width=1000,
+#                 height=600,
+#                 paper_bgcolor='white'
+#             )
+            
+#             # Convert to PNG - try multiple methods
+#             img_bytes = pio.to_image(fig, format="png", width=1000, height=600, scale=2)
+            
+#             return dcc.send_bytes(img_bytes, filename=f"dashboard_{selected_year}_{selected_metric}.png")
+            
+#     except Exception as e:
+#         print(f"Export error: {e}")
+#         return dash.no_update
+    
+#     return dash.no_update
 # ------------------------------------------------------------------
 # 10. Run the app
 # ------------------------------------------------------------------
